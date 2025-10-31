@@ -1,0 +1,145 @@
+name: Build Mainline LTS Kernels
+
+on:
+  # 3. TRIGGER: Runs daily at 5:00 UTC
+  schedule:
+    - cron: '0 5 * * *'
+  # Also allows you to run it manually from the "Actions" tab
+  workflow_dispatch:
+
+jobs:
+  # JOB 1: Get the list of current LTS kernel versions
+  get_versions:
+    name: Get LTS Kernel Versions
+    runs-on: ubuntu-latest
+    outputs:
+      # This output will be a JSON string, e.g., ["6.12.56", "6.6.115", ...]
+      lts_versions: ${{ steps.set_matrix.outputs.lts_versions }}
+      
+    steps:
+      - name: Install curl and jq
+        run: sudo apt-get install -y curl jq
+
+      - name: Fetch and Parse LTS Versions
+        id: set_matrix
+        run: |
+          # 1. Fetch the official releases JSON
+          # 2. Pipe to jq
+          # 3. Select all items in the 'releases' array
+          # 4. Filter for items where 'islts' is true
+          # 5. Get the 'version' string for each
+          # 6. Collect all version strings into a single JSON array
+          JSON_ARRAY=$(curl -s https://www.kernel.org/releases.json | \
+                       jq -c '[.releases[] | select(.islts == true) | .version]')
+          
+          echo "Found LTS versions: $JSON_ARRAY"
+          echo "lts_versions=$JSON_ARRAY" >> $GITHUB_OUTPUT
+
+  # JOB 2: Build all kernels in parallel based on the list from Job 1
+  build:
+    name: Build Kernel ${{ matrix.kernel_version }}
+    runs-on: ubuntu-latest
+    # Wait for the get_versions job to succeed
+    needs: get_versions
+    
+    strategy:
+      fail-fast: false
+      # This is the key: it reads the JSON array from the previous job
+      matrix:
+        kernel_version: ${{ fromJSON(needs.get_versions.outputs.lts_versions) }}
+
+    steps:
+      - name: 1. Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc fakeroot dpkg-dev
+
+      - name: 2. Download Kernel Source
+        run: |
+          KERNEL_VER=${{ matrix.kernel_version }}
+          # Get major version (e.g., 6.12) from '6.12.56'
+          KERNEL_MAJOR=$(echo $KERNEL_VER | cut -d. -f1,2)
+          wget https://cdn.kernel.org/pub/linux/kernel/v$KERNEL_MAJOR/linux-$KERNEL_VER.tar.xz
+          tar -xf linux-$KERNEL_VER.tar.xz
+          echo "KERNEL_DIR=linux-$KERNEL_VER" >> $GITHUB_ENV
+
+      - name: 3. Configure Kernel (Optimized, No-Debug)
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # Start with a default config
+          make defconfig
+          
+          # --- Disable Debugging, Tracing, and Logging ---
+          ./scripts/config --disable DEBUG_INFO
+          ./scripts/config --disable KERNEL_DEBUG
+          ./scripts/config --disable DEBUG_KERNEL
+          ./scripts/config --disable FTRACE
+          ./scripts/config --disable TRACING
+          ./scripts/config --disable KPROBES
+          ./scripts/config --disable FUNCTION_TRACER
+          ./scripts/config --disable TRACER_MAX_TRACE
+          ./scripts/config --disable KERNEL_GCOV
+          ./scripts/config --disable GCOV_KERNEL
+          ./scripts/config --disable DYNAMIC_DEBUG
+          ./scripts/config --disable PRINTK
+          
+          # --- Set O3 Optimization ---
+          ./scripts/config --enable CC_OPTIMIZE_FOR_PERFORMANCE_O3
+          
+          # Save the new .config
+          make olddefconfig
+          
+      - name: 4. Compile Kernel into .deb Packages
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # Get the number of CPU cores
+          CPU_CORES=$(nproc)
+          
+          # This command builds the kernel and creates all the .deb packages
+          fakeroot make -j$CPU_CORES bindeb-pkg
+          
+      - name: 5. Upload Artifacts for Release Job
+        uses: actions/upload-artifact@v4
+        with:
+          # Create an artifact named "debs-6.12.56", etc.
+          name: debs-${{ matrix.kernel_version }}
+          # The deb files are created one directory *up*
+          path: ../*.deb
+
+  # JOB 3: Create a single release *after* all builds finish
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    # This job 'needs' (waits for) the parallel 'build' jobs to complete
+    needs: build
+    
+    steps:
+      - name: 1. Set Release Tag
+        run: |
+          RELEASE_DATE=$(date +'%Y-%m-%d')
+          echo "RELEASE_TAG=lts-build-${RELEASE_DATE}" >> $GITHUB_ENV
+          
+      - name: 2. Download all .deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # Download all artifacts created by the build jobs
+          path: all-debs
+          
+      - name: 3. Organize Files
+        run: |
+          mkdir release-files
+          # Move all .deb files from their subfolders into one place
+          find all-debs -name "*.deb" -exec mv {} release-files/ \;
+          echo "--- Files to be released: ---"
+          ls release-files/
+
+      - name: 4. Create GitHub Release and Upload Debs
+        uses: softprops/action-gh-release@v1
+        with:
+          # This creates a new release
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "LTS Kernel Build (${{ env.RELEASE_DATE }})"
+          body: "Automated build of all dynamically fetched LTS kernels."
+          
+          # This uploads all the .deb files from all builds
+          files: release-files/*.deb
