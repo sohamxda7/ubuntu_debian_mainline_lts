@@ -1,7 +1,7 @@
 name: Build Mainline LTS Kernels
 
 on:
-  # 3. TRIGGER: Runs daily at 5:00 UTC
+  # Runs daily at 5:00 UTC
   schedule:
     - cron: '0 5 * * *'
   # Also allows you to run it manually from the "Actions" tab
@@ -41,6 +41,10 @@ jobs:
     runs-on: ubuntu-latest
     # Wait for the get_versions job to succeed
     needs: get_versions
+    
+    # --- THIS IS THE FIX ---
+    # Only run this job if the list of versions is NOT empty
+    if: ${{ needs.get_versions.outputs.lts_versions != '[]' }}
     
     strategy:
       fail-fast: false
