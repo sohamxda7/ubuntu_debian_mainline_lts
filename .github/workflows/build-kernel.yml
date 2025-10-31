@@ -1,6 +1,7 @@
 name: Build Mainline LTS Kernels
 
 on:
+  # 1. TRIGGERS
   # Runs daily at 5:00 UTC
   schedule:
     - cron: '0 5 * * *'
@@ -13,6 +14,7 @@ jobs:
     name: Get LTS Kernel Versions
     runs-on: ubuntu-latest
     outputs:
+      # This output will be a JSON string, e.g., ["6.12.56", "6.6.115", ...]
       lts_versions: ${{ steps.set_matrix.outputs.lts_versions }}
       
     steps:
@@ -23,6 +25,9 @@ jobs:
         id: set_matrix
         run: |
           echo "Fetching kernel.org releases.json..."
+          # Fetch the official releases JSON, parse with jq,
+          # and select the version string for all entries
+          # marked as "moniker": "longterm".
           JSON_ARRAY=$(curl -s https://www.kernel.org/releases.json | \
                        jq -c '[.releases[] | select(.moniker == "longterm") | .version]')
           
@@ -33,12 +38,15 @@ jobs:
   build:
     name: Build Kernel ${{ matrix.kernel_version }}
     runs-on: ubuntu-latest
+    # Wait for the get_versions job to succeed
     needs: get_versions
     
+    # Only run this job if the versions list is not empty
     if: ${{ needs.get_versions.outputs.lts_versions != '[]' }}
     
     strategy:
       fail-fast: false
+      # Create a parallel job for each version found in the JSON array
       matrix:
         kernel_version: ${{ fromJSON(needs.get_versions.outputs.lts_versions) }}
 
@@ -46,9 +54,9 @@ jobs:
       - name: 1. Install Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc fakeroot dpkg-dev
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc fakeroot dpkg-dev \
+          debhelper
 
-      # --- THIS STEP IS NOW FIXED ---
       - name: 2. Download Kernel Source
         run: |
           KERNEL_VER=${{ matrix.kernel_version }}
@@ -63,59 +71,94 @@ jobs:
       - name: 3. Configure Kernel (Optimized, No-Debug)
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
+          # Start with a default config
           make defconfig
           
-          # --- Disable Debugging, Tracing, and Logging ---
-          ./scripts/config --disable DEBUG_INFO
-          ./scripts/config --disable KERNEL_DEBUG
+          # --- Disable Debugging, Tracing, and Logging (Expanded List) ---
+          
+          # General debug meta-options
           ./scripts/config --disable DEBUG_KERNEL
+          ./scripts/config --disable KERNEL_DEBUG
+          
+          # Tracing (ftrace, probes)
           ./scripts/config --disable FTRACE
           ./scripts/config --disable TRACING
           ./scripts/config --disable KPROBES
           ./scripts/config --disable FUNCTION_TRACER
           ./scripts/config --disable TRACER_MAX_TRACE
+
+          # Profiling and coverage
+          ./scripts/config --disable PROFILING
           ./scripts/config --disable KERNEL_GCOV
           ./scripts/config --disable GCOV_KERNEL
+          
+          # Debug symbols and filesystems
+          ./scripts/config --disable DEBUG_INFO
+          ./scripts/config --disable DEBUG_FS
+          
+          # Printk (logging)
           ./scripts/config --disable DYNAMIC_DEBUG
           ./scripts/config --disable PRINTK
+
+          # Lock/memory debuggers (major overhead)
+          ./scripts/config --disable LOCKDEP
+          ./scripts/config --disable LOCK_STAT
+          ./scripts/config --disable DEBUG_SPINLOCK
+          ./scripts/config --disable DEBUG_MUTEXES
+          ./scripts/config --disable DEBUG_ATOMIC_SLEEP
+          ./scripts/config --disable DEBUG_VM
+          ./scripts/config --disable DEBUG_SLAB
+          ./scripts/config --disable SLUB_DEBUG
+          
+          # Recovery tools (SysRq)
+          ./scripts/config --disable MAGIC_SYSRQ
           
           # --- Set O3 Optimization ---
           ./scripts/config --enable CC_OPTIMIZE_FOR_PERFORMANCE_O3
           
+          # Apply all changes
           make olddefconfig
           
       - name: 4. Compile Kernel into .deb Packages
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
+          # Use all available CPU cores for a faster build
           CPU_CORES=$(nproc)
+          # Use fakeroot to build .deb packages without root
           fakeroot make -j$CPU_CORES bindeb-pkg
           
       - name: 5. Upload Artifacts for Release Job
         uses: actions/upload-artifact@v4
         with:
+          # Create a unique artifact for each build job
           name: debs-${{ matrix.kernel_version }}
+          # The deb files are created in the parent directory
           path: ../*.deb
 
   # JOB 3: Create a single release *after* all builds finish
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    # This job 'needs' (waits for) the parallel 'build' jobs to complete
     needs: build
     
     steps:
       - name: 1. Set Release Tag
         run: |
+          # Create a tag based on the date, e.g., lts-build-2025-10-31
           RELEASE_DATE=$(date +'%Y-%m-%d')
           echo "RELEASE_TAG=lts-build-${RELEASE_DATE}" >> $GITHUB_ENV
           
       - name: 2. Download all .deb artifacts
         uses: actions/download-artifact@v4
         with:
+          # Download all artifacts from all build jobs into one directory
           path: all-debs
           
-      - name: 3. Organize Files
+      - name: 3. Organize Files for Release
         run: |
           mkdir release-files
+          # Move all .deb files from their subfolders into one place
           find all-debs -name "*.deb" -exec mv {} release-files/ \;
           echo "--- Files to be released: ---"
           ls release-files/
@@ -126,4 +169,5 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           name: "LTS Kernel Build (${{ env.RELEASE_DATE }})"
           body: "Automated build of all dynamically fetched LTS kernels."
+          # Upload all .deb files to the release
           files: release-files/*.deb
