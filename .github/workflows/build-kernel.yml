@@ -23,8 +23,6 @@ jobs:
         id: set_matrix
         run: |
           echo "Fetching kernel.org releases.json..."
-          # --- THIS IS THE FIX ---
-          # We now select based on "moniker" == "longterm"
           JSON_ARRAY=$(curl -s https://www.kernel.org/releases.json | \
                        jq -c '[.releases[] | select(.moniker == "longterm") | .version]')
           
@@ -37,9 +35,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: get_versions
     
-    # This 'if' condition is still good practice.
-    # It will skip the build if kernel.org ever changes their JSON
-    # and the list becomes empty again.
     if: ${{ needs.get_versions.outputs.lts_versions != '[]' }}
     
     strategy:
@@ -53,11 +48,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc fakeroot dpkg-dev
 
+      # --- THIS STEP IS NOW FIXED ---
       - name: 2. Download Kernel Source
         run: |
           KERNEL_VER=${{ matrix.kernel_version }}
-          KERNEL_MAJOR=$(echo $KERNEL_VER | cut -d. -f1,2)
-          wget https://cdn.kernel.org/pub/linux/kernel/v$KERNEL_MAJOR/linux-$KERNEL_VER.tar.xz
+          # Get major version (e.g., 6) from '6.12.56'
+          KERNEL_MAJOR=$(echo $KERNEL_VER | cut -d. -f1)
+          # Construct the URL as .../v6.x/...
+          wget https://cdn.kernel.org/pub/linux/kernel/v$KERNEL_MAJOR.x/linux-$KERNEL_VER.tar.xz
+          
           tar -xf linux-$KERNEL_VER.tar.xz
           echo "KERNEL_DIR=linux-$KERNEL_VER" >> $GITHUB_ENV
 
